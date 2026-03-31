@@ -99,52 +99,32 @@ Displays detailed information about a binary file. Supports Mach-O, ELF, and llb
 python3 tools/lltool.py info myprogram.llbin
 ```
 
-Example output for an llbin:
+#### `elf2bin`
 
-```
-=== llbin header ===
-  magic:          0x4e424c4c (LLBN)
-  version:        1
-  arch:           0x0100000c (ARM64)
-  entry_off:      0x3f40
-  image_size:     0x8000 (32768)
-  preferred_base: 0x100000000
-  fixup_count:    142
-  import_count:   8
-  strings_size:   87
-  seg_count:      3
+Converts a static-pie ELF executable into a flat binary image suitable for stager loading. The output preserves the ELF header at offset 0 (for entry point and program headers) but is otherwise a flat memory dump with BSS trimmed and dead metadata zeroed.
 
-=== imports ===
-  [0] _printf
-  [1] _malloc
-  ...
+```sh
+# Convert ELF to flat binary
+python3 tools/lltool.py elf2bin input.elf output.bin
 
-=== segments ===
-  [0] offset=0x0000 size=0x4000 prot=r-x
-  [1] offset=0x4000 size=0x3000 prot=rw-
-  [2] offset=0x7000 size=0x1000 prot=r--
+# Print entry offset only
+python3 tools/lltool.py elf2bin -e input.elf
 ```
 
-Example output for an ELF:
+| Argument | Description |
+|----------|-------------|
+| `input` | Path to a static-pie ELF executable |
+| `output` | Path for the output flat binary (optional with `-e`) |
+| `-e`, `--entry-only` | Print the entry point offset and exit |
+| `--trailer` | Append legacy bin_info trailer |
+| `--no-strip` | Keep dead metadata and trailing BSS |
 
-```
-=== ELF header ===
-  class:   ELF64
-  machine: EM_AARCH64 (183)
-  type:    ET_DYN
-  entry:   0x1060
-  ...
+The output can be loaded at runtime by:
+1. `mmap(RWX, page_align(memsz))` — memsz computed from LOAD segments
+2. `read(len)` into the mapping — MAP_ANONYMOUS zero-fills BSS beyond
+3. Jump to `base + e_entry`
 
-=== program headers ===
-  PT_LOAD  offset=0x0000 vaddr=0x0000 memsz=0x0800 flags=r--
-  PT_LOAD  offset=0x1000 vaddr=0x1000 memsz=0x0200 flags=r-x
-  ...
-
-=== dynamic section ===
-  DT_NEEDED: libc.so.6
-  DT_RELA:   0x0580
-  ...
-```
+See [elf2bin.md](elf2bin.md) for format details.
 
 ### Advantage Over llpack
 

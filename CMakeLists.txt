@@ -117,4 +117,18 @@ if(UNIX AND NOT APPLE)
 
     add_executable(test_inject_spawn examples/linux/test_inject_spawn.c)
     target_link_libraries(test_inject_spawn PRIVATE libload_static)
+
+    add_executable(test_bin examples/linux/test_bin.c)
+    target_compile_options(test_bin PRIVATE -Wno-unused-parameter)
+
+    # Architecture-specific assembly bin loaders
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        add_executable(test_bin_asm
+            examples/linux/test_bin_aarch64.S)
+        target_link_options(test_bin_asm PRIVATE -nostdlib -static)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
+        add_executable(test_bin_asm
+            examples/linux/test_bin_x86_64.S)
+        target_link_options(test_bin_asm PRIVATE -nostdlib -static)
+    endif()
 endif()

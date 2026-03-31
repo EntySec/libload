@@ -105,6 +105,12 @@ pid_t     libload_exec(const unsigned char *buf, size_t len,
 int       libload_run(const unsigned char *buf, size_t len,
                       char *const argv[], char *const envp[]);
 
+/* Flat binary execution (Linux, for elf2bin images) */
+pid_t     libload_exec_bin(const unsigned char *buf, size_t len,
+                           char *const argv[], char *const envp[]);
+int       libload_run_bin(const unsigned char *buf, size_t len,
+                          char *const argv[], char *const envp[]);
+
 /* Injection (platform-specific) */
 int       libload_inject(pid_t pid, const void *code, size_t len,
                          size_t entry_offset, uint64_t arg);
@@ -128,19 +134,27 @@ python3 tools/lltool.py info output.llbin
 
 `libload_open` and `libload_exec` auto-detect llbin magic and use the fast path.
 
+## elf2bin — Flat Binary Images
+
+Convert static-pie ELF executables into minimal flat binary images for stager loading:
+
+```sh
+python3 tools/lltool.py elf2bin input.elf output.bin
+```
+
+Load with `libload_exec_bin` / `libload_run_bin`, or directly from a stager via `mmap` + `memcpy` + `jump`.
+
 ## Documentation
 
 Detailed documentation is available in the [docs/](docs/) directory:
 
-- [Overview](docs/overview.md) — architecture and design
 - [Building](docs/building.md) — build instructions and cross-compilation
 - [API Reference](docs/api-reference.md) — complete function reference
+- [Linux Platform](docs/linux.md) — ELF loader, injection, architecture support
+- [macOS Platform](docs/macos.md) — Mach-O loader, injection, dual-map technique
 - [llbin Format](docs/llbin-format.md) — binary format specification
-- [Linux Platform](docs/linux.md) — ELF loader internals, architecture support
-- [macOS Platform](docs/macos.md) — Mach-O loader, dual-map technique
-- [Process Injection](docs/injection.md) — injection methods for both platforms
+- [elf2bin Format](docs/elf2bin.md) — flat binary format and C API
 - [Tools](docs/tools.md) — llpack and lltool usage
-- [Examples](docs/examples.md) — annotated example programs
 
 ## Limitations
 

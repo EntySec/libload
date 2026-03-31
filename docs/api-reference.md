@@ -173,6 +173,73 @@ Identical to `libload_exec` except it does not fork. The current process image i
 
 ---
 
+## Flat Binary Execution Functions (Linux)
+
+These functions execute flat binary images produced by `lltool elf2bin`. The image is a contiguous memory dump with the ELF header preserved at offset 0 (used for entry point and program headers). BSS is trimmed for smaller wire size — the loader computes total memsz from LOAD segments and zero-fills beyond the file data.
+
+### `libload_exec_bin`
+
+```c
+pid_t libload_exec_bin(const unsigned char *buf, size_t len,
+                       char *const argv[], char *const envp[]);
+```
+
+Execute a flat binary image in a forked child process.
+
+**Parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `buf` | Pointer to the flat binary data (produced by `lltool elf2bin`) |
+| `len` | Size of the buffer in bytes |
+| `argv` | NULL-terminated argument vector |
+| `envp` | NULL-terminated environment vector (NULL = inherit) |
+
+**Returns:** Child PID on success, -1 on failure.
+
+**Behavior:**
+
+1. Forks the current process
+2. In the child: reads the ELF header from the image to compute total memsz
+3. Maps an RWX region of memsz bytes, copies the image
+4. Sets up the initial stack (argc, argv, envp, auxiliary vector)
+5. Jumps to the entry point (base + e_entry)
+
+**Example:**
+
+```c
+char *argv[] = { "program", NULL };
+pid_t pid = libload_exec_bin(bin_buf, bin_len, argv, NULL);
+if (pid > 0) {
+    int status;
+    waitpid(pid, &status, 0);
+}
+```
+
+---
+
+### `libload_run_bin`
+
+```c
+int libload_run_bin(const unsigned char *buf, size_t len,
+                    char *const argv[], char *const envp[]);
+```
+
+Execute a flat binary image, replacing the current process. Does NOT fork.
+
+**Parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `buf` | Pointer to the flat binary data |
+| `len` | Size of the buffer in bytes |
+| `argv` | NULL-terminated argument vector |
+| `envp` | NULL-terminated environment vector (NULL = inherit) |
+
+**Returns:** -1 on failure. **Does not return on success.**
+
+---
+
 ## Injection Functions
 
 All injection functions are platform-specific and conditionally compiled. They are available when `__APPLE__` or `__linux__` is defined.

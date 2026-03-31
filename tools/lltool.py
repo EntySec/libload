@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 #
-# lltool — Mach-O/ELF → llbin packer (Python3)
+# lltool — Mach-O/ELF → llbin packer, ELF → flat binary converter (Python3)
 #
 # Reads a Mach-O executable (or fat binary) or ELF executable,
 # flattens all segments into a contiguous image, extracts
 # relocations and import references, and writes an llbin file
 # that can be loaded trivially at runtime.
 #
-# Usage: lltool pack <input> <output.llbin>
-#        lltool info <file.llbin|file.macho|file.elf>
+# Also converts static-pie ELF executables to flat binary images
+# suitable for direct stager loading (mmap + jump).
+#
+# Usage: lltool pack    <input> <output.llbin>
+#        lltool info    <file.llbin|file.macho|file.elf>
+#        lltool elf2bin <input.elf> <output.bin>
+#        lltool elf2bin -e <input.elf>
 
 import argparse
 import struct
@@ -99,6 +104,23 @@ PT_DYNAMIC = 2
 PF_X = 1
 PF_W = 2
 PF_R = 4
+
+# ── elf2bin constants ────────────────────────────────────────────
+
+BIN_MAGIC = b'\x7fBIN'
+
+EI_CLASS_OFF = 4
+EI_DATA_OFF  = 5
+
+SHT_NULL    = 0
+SHT_SYMTAB  = 2
+SHT_STRTAB  = 3
+SHT_NOTE    = 7
+SHT_NOBITS  = 8
+SHF_ALLOC   = 0x2
+
+_DEAD_SHTYPES = {SHT_SYMTAB, SHT_NOTE}
+_DEAD_NAMES = {b'.comment', b'.symtab', b'.strtab', b'.shstrtab'}
 
 DT_NULL    = 0
 DT_NEEDED  = 1
@@ -1286,11 +1308,294 @@ def cmd_pack(input_path: str, output_path: str):
     print(f"  wrote {output_path} ({total} bytes)")
 
 
+# ─── elf2bin — ELF to flat binary ────────────────────────────────
+
+def _parse_elf_bin(data):
+    """Parse an ELF file for elf2bin conversion.
+
+    Returns dict with keys:
+        bits, endian, entry, segments, dynamic,
+        e_shoff, e_shnum, e_shentsize, sections.
+    """
+    if len(data) < 16:
+        raise ValueError('file too small to be ELF')
+    if data[:4] != ELF_MAGIC:
+        raise ValueError('not an ELF file (bad magic)')
+
+    bits = {ELFCLASS32: 32, ELFCLASS64: 64}.get(data[EI_CLASS_OFF])
+    if bits is None:
+        raise ValueError(f'unsupported ELF class {data[EI_CLASS_OFF]}')
+
+    endian = {ELFDATA2LSB: '<', ELFDATA2MSB: '>'}.get(data[EI_DATA_OFF])
+    if endian is None:
+        raise ValueError(f'unsupported ELF data encoding {data[EI_DATA_OFF]}')
+
+    if bits == 64:
+        ehdr_fmt = f'{endian}HHI QQQ I HHHHHH'
+        ehdr_size = 64
+    else:
+        ehdr_fmt = f'{endian}HHI III I HHHHHH'
+        ehdr_size = 52
+
+    if len(data) < ehdr_size:
+        raise ValueError('truncated ELF header')
+
+    fields = struct.unpack_from(ehdr_fmt, data, 16)
+    (e_type, _e_machine, _e_version, e_entry,
+     e_phoff, e_shoff, _e_flags, _e_ehsize,
+     e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx) = fields
+
+    if e_type not in (ET_EXEC, ET_DYN):
+        raise ValueError(f'unsupported ELF type {e_type} (need ET_EXEC or ET_DYN)')
+
+    segments = []
+    dynamic_vaddr = 0
+    for i in range(e_phnum):
+        off = e_phoff + i * e_phentsize
+        if off + e_phentsize > len(data):
+            raise ValueError(f'program header {i} extends past EOF')
+        if bits == 64:
+            (p_type, _p_flags, p_offset, p_vaddr, _p_paddr,
+             p_filesz, p_memsz, _p_align) = struct.unpack_from(
+                f'{endian}II QQQQQQ', data, off)
+        else:
+            (p_type, p_offset, p_vaddr, _p_paddr,
+             p_filesz, p_memsz, _p_flags, _p_align) = struct.unpack_from(
+                f'{endian}I IIIIII', data, off)
+
+        if p_type == PT_LOAD:
+            segments.append((p_type, p_offset, p_vaddr, p_filesz, p_memsz))
+        elif p_type == PT_DYNAMIC:
+            dynamic_vaddr = p_vaddr
+
+    if not segments:
+        raise ValueError('no PT_LOAD segments')
+
+    sections = []
+    shstrtab_data = b''
+
+    if e_shoff and e_shnum and e_shentsize:
+        if e_shstrndx < e_shnum:
+            shstr_hdr_off = e_shoff + e_shstrndx * e_shentsize
+            if shstr_hdr_off + e_shentsize <= len(data):
+                if bits == 64:
+                    shstr_f = struct.unpack_from(
+                        f'{endian}II QQQQII QQ', data, shstr_hdr_off)
+                else:
+                    shstr_f = struct.unpack_from(
+                        f'{endian}IIIIIIIIII', data, shstr_hdr_off)
+                shstrtab_off = shstr_f[4]
+                shstrtab_sz = shstr_f[5]
+                if shstrtab_off + shstrtab_sz <= len(data):
+                    shstrtab_data = data[shstrtab_off:shstrtab_off + shstrtab_sz]
+
+        for i in range(e_shnum):
+            sh_off = e_shoff + i * e_shentsize
+            if sh_off + e_shentsize > len(data):
+                break
+            if bits == 64:
+                (sh_name, sh_type, sh_flags, sh_addr, sh_offset,
+                 sh_size, sh_link, _sh_info,
+                 _sh_addralign, sh_entsize) = struct.unpack_from(
+                    f'{endian}II QQQQII QQ', data, sh_off)
+            else:
+                (sh_name, sh_type, sh_flags, sh_addr, sh_offset,
+                 sh_size, sh_link, _sh_info,
+                 _sh_addralign, sh_entsize) = struct.unpack_from(
+                    f'{endian}IIIIIIIIII', data, sh_off)
+
+            name = b''
+            if sh_name < len(shstrtab_data):
+                nul = shstrtab_data.find(b'\0', sh_name)
+                if nul >= 0:
+                    name = shstrtab_data[sh_name:nul]
+
+            sections.append({
+                'sh_type': sh_type, 'sh_flags': sh_flags,
+                'sh_offset': sh_offset, 'sh_size': sh_size,
+                'sh_addr': sh_addr, 'sh_link': sh_link,
+                'sh_entsize': sh_entsize, 'name': name,
+            })
+
+    return {
+        'bits': bits, 'endian': endian, 'entry': e_entry,
+        'e_shoff': e_shoff, 'e_shnum': e_shnum,
+        'e_shentsize': e_shentsize,
+        'segments': segments, 'dynamic': dynamic_vaddr,
+        'sections': sections,
+    }
+
+
+def _elf2bin_image(data, trailer=False, strip_meta=True):
+    """Convert ELF bytes to a flat binary image."""
+    info = _parse_elf_bin(data)
+    segs = info['segments']
+
+    lo = min(seg[2] for seg in segs)
+    lo = lo & ~0xfff
+
+    if strip_meta:
+        file_hi = max(seg[2] + seg[3] for seg in segs)
+    else:
+        file_hi = max(seg[2] + seg[4] for seg in segs)
+
+    image_size = file_hi - lo
+    image = bytearray(image_size)
+
+    for (_ptype, p_offset, p_vaddr, p_filesz, _p_memsz) in segs:
+        if p_filesz == 0:
+            continue
+        src_end = p_offset + p_filesz
+        if src_end > len(data):
+            raise ValueError(
+                f'PT_LOAD at vaddr 0x{p_vaddr:x}: file data '
+                f'(offset 0x{p_offset:x} + 0x{p_filesz:x}) extends past EOF')
+        dest = p_vaddr - lo
+        image[dest:dest + p_filesz] = data[p_offset:src_end]
+
+    if strip_meta:
+        _zero_dead_metadata(image, info, lo)
+
+    if trailer:
+        endian = info['endian']
+        start_func = _find_start_c(data, info) or info['entry']
+        if info['bits'] == 64:
+            trl = struct.pack(f'{endian}qq', start_func, info['dynamic'])
+        else:
+            trl = struct.pack(f'{endian}ii', start_func, info['dynamic'])
+        trl += BIN_MAGIC
+        image.extend(trl)
+
+    return bytes(image)
+
+
+def _zero_dead_metadata(image, info, lo):
+    """Zero out runtime-dead sections within the flat image."""
+    for sect in info['sections']:
+        if sect['sh_size'] == 0 or sect['sh_type'] == SHT_NOBITS:
+            continue
+        if not (sect['sh_flags'] & SHF_ALLOC):
+            continue
+
+        is_dead = (sect['sh_type'] in _DEAD_SHTYPES or
+                   sect['name'] in _DEAD_NAMES)
+        if not is_dead:
+            continue
+
+        img_off = sect['sh_addr'] - lo
+        if img_off < 0 or img_off + sect['sh_size'] > len(image):
+            continue
+
+        if sect['sh_type'] == SHT_STRTAB and sect['name'] not in _DEAD_NAMES:
+            continue
+
+        image[img_off:img_off + sect['sh_size']] = b'\0' * sect['sh_size']
+
+    sh_off = info['e_shoff']
+    sh_size = info['e_shnum'] * info['e_shentsize']
+    if sh_off and sh_size and sh_off + sh_size <= len(image):
+        image[sh_off:sh_off + sh_size] = b'\0' * sh_size
+
+    endian = info['endian']
+    if info['bits'] == 64:
+        struct.pack_into(f'{endian}Q', image, 40, 0)
+        struct.pack_into(f'{endian}HHH', image, 58, 0, 0, 0)
+    else:
+        struct.pack_into(f'{endian}I', image, 32, 0)
+        struct.pack_into(f'{endian}HHH', image, 46, 0, 0, 0)
+
+
+def _find_start_c(data, info):
+    """Find _start_c symbol vaddr (for legacy trailer only)."""
+    for sect in info['sections']:
+        if sect['sh_type'] != SHT_SYMTAB or sect['sh_entsize'] == 0:
+            continue
+        sh_link = sect['sh_link']
+        if sh_link >= len(info['sections']):
+            return 0
+        strtab = info['sections'][sh_link]
+        strtab_off = strtab['sh_offset']
+
+        nsyms = sect['sh_size'] // sect['sh_entsize']
+        for j in range(nsyms):
+            sym_off = sect['sh_offset'] + j * sect['sh_entsize']
+            if sym_off + sect['sh_entsize'] > len(data):
+                break
+            if info['bits'] == 64:
+                (st_name, _, _, _, st_value, _) = struct.unpack_from(
+                    f'{info["endian"]}I BBH QQ', data, sym_off)
+            else:
+                (st_name, st_value, _, _, _, _) = struct.unpack_from(
+                    f'{info["endian"]}III BBH', data, sym_off)
+            name_off = strtab_off + st_name
+            if name_off >= len(data):
+                continue
+            nul = data.find(b'\0', name_off, name_off + 256)
+            if nul < 0:
+                continue
+            if data[name_off:nul] == b'_start_c':
+                return st_value
+        break
+    return 0
+
+
+def _elf2bin_entry(data):
+    """Return the e_entry offset suitable for the stager."""
+    info = _parse_elf_bin(data)
+    lo = min(seg[2] for seg in info['segments'])
+    lo = lo & ~0xfff
+    return info['entry'] - lo
+
+
+def cmd_elf2bin(input_path, output_path=None, entry_only=False,
+                trailer=False, no_strip=False):
+    """Convert a static-pie ELF to a flat binary image."""
+    with open(input_path, 'rb') as f:
+        data = f.read()
+
+    if entry_only:
+        print(f'0x{_elf2bin_entry(data):x}')
+        return
+
+    if not output_path:
+        print('error: output file is required (unless using -e)',
+              file=sys.stderr)
+        sys.exit(1)
+
+    info = _parse_elf_bin(data)
+    strip = not no_strip
+    image = _elf2bin_image(data, trailer=trailer, strip_meta=strip)
+
+    lo = min(seg[2] for seg in info['segments'])
+    lo = lo & ~0xfff
+    file_hi = max(seg[2] + seg[3] for seg in info['segments'])
+    mem_hi = max(seg[2] + seg[4] for seg in info['segments'])
+
+    print(f'elf2bin: {input_path} ({len(data)} bytes)')
+    print(f'  class:    ELF{info["bits"]} {"LE" if info["endian"] == "<" else "BE"}')
+    print(f'  entry:    0x{info["entry"]:x} (offset 0x{info["entry"] - lo:x})')
+    print(f'  base:     0x{lo:x}')
+    print(f'  segments: {len(info["segments"])}')
+    for i, (_, p_off, p_va, p_fsz, p_msz) in enumerate(info['segments']):
+        print(f'    [{i}] vaddr=0x{p_va:x}  filesz=0x{p_fsz:x}  memsz=0x{p_msz:x}')
+    if info['dynamic']:
+        print(f'  dynamic:  0x{info["dynamic"]:x}')
+
+    saved = (mem_hi - lo) - len(image)
+    if strip and saved > 0:
+        print(f'  trimmed:  {saved} bytes (BSS + metadata)')
+
+    with open(output_path, 'wb') as f:
+        f.write(image)
+
+    print(f'  output:   {output_path} ({len(image)} bytes)')
+
+
 # ─── Main ─────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="lltool — Mach-O/ELF/llbin packer and inspector")
+        description="lltool — Mach-O/ELF/llbin packer, inspector, and converter")
     sub = parser.add_subparsers(dest='command')
 
     p_pack = sub.add_parser('pack', help='Pack Mach-O or ELF into llbin format')
@@ -1300,12 +1605,26 @@ def main():
     p_info = sub.add_parser('info', help='Show info about a Mach-O, ELF, or llbin')
     p_info.add_argument('file', help='Input file (.macho, ELF, or .llbin)')
 
+    p_e2b = sub.add_parser('elf2bin',
+                           help='Convert static-pie ELF to flat binary image')
+    p_e2b.add_argument('input', help='Input ELF file')
+    p_e2b.add_argument('output', nargs='?', help='Output binary file')
+    p_e2b.add_argument('-e', '--entry-only', action='store_true',
+                       help='Print entry offset and exit')
+    p_e2b.add_argument('--no-trailer', action='store_true',
+                       help='Omit bin_info trailer (image will lack entry metadata)')
+    p_e2b.add_argument('--no-strip', action='store_true',
+                       help='Keep dead metadata and trailing BSS')
+
     args = parser.parse_args()
 
     if args.command == 'pack':
         cmd_pack(args.input, args.output)
     elif args.command == 'info':
         cmd_info(args.file)
+    elif args.command == 'elf2bin':
+        cmd_elf2bin(args.input, args.output, args.entry_only,
+                    not args.no_trailer, args.no_strip)
     else:
         parser.print_help()
         sys.exit(1)

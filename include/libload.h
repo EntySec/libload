@@ -59,6 +59,24 @@ pid_t libload_exec(const unsigned char *buf, size_t len,
 int libload_run(const unsigned char *buf, size_t len,
                 char *const argv[], char *const envp[]);
 
+/*
+ * Execute a flat binary image (produced by lltool elf2bin --trailer)
+ * in a child process. The image must have a bin_info trailer with
+ * start_function, dynamic_linker_info offsets, and \x7fBIN magic.
+ *
+ * Returns child PID on success, -1 on failure.
+ */
+pid_t libload_exec_bin(const unsigned char *buf, size_t len,
+                       char *const argv[], char *const envp[]);
+
+/*
+ * Execute a flat binary image, replacing the current process.
+ * Does NOT fork — this function does not return on success.
+ * Returns -1 on failure.
+ */
+int libload_run_bin(const unsigned char *buf, size_t len,
+                    char *const argv[], char *const envp[]);
+
 #ifdef __APPLE__
 
 #include <stdint.h>

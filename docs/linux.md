@@ -142,7 +142,48 @@ The `LL_FLUSH_ICACHE` macro handles this:
 
 ## Limitations
 
-- Only dynamic executables (those with a `PT_DYNAMIC` segment) are supported for loading. Statically-linked executables can only be executed via `libload_exec`/`libload_run`.
+- Only dynamic executables (those with a `PT_DYNAMIC` segment) are supported for `libload_open`. Statically-linked executables can be executed via `libload_exec`/`libload_run` or converted to flat binaries via `lltool elf2bin` and executed with `libload_exec_bin`/`libload_run_bin`.
 - `libload_open` requires the ELF to be a shared object (`ET_DYN`) or position-independent executable
 - Thread-local storage (`PT_TLS`) is not handled
 - MIPS `R_MIPS_REL32` with non-zero symbol is treated as absolute import; more exotic MIPS relocation types are not supported
+
+## Process Injection
+
+Three injection methods are available on Linux, all based on ptrace.
+
+### Privilege Requirements
+
+| Method | Requirement |
+|--------|-------------|
+| `libload_inject` | ptrace access (Yama scope 0, `CAP_SYS_PTRACE`, or target is direct child) |
+| `libload_inject_dylib` | Same |
+| `libload_inject_spawn` | **None** |
+
+### `libload_inject` — PIC Code Injection
+
+Uses ptrace to proxy syscalls in the target: `mmap` (allocate RW), `process_vm_writev` (copy code), `mprotect` (RW→RX), `clone` (new thread at entry). The injector scans the target's executable memory for the architecture-specific syscall instruction to use as a gadget.
+
+| Architecture | Syscall Instruction |
+|-------------|---------------------|
+| x86_64 | `syscall` (`0F 05`) |
+| aarch64 | `svc #0` (`01 00 00 D4`) |
+| i386 | `int 0x80` (`CD 80`) |
+| ARM | `svc #0` (`00 00 00 EF` / `00 DF` Thumb) |
+| MIPS | `syscall` (`0C 00 00 00`) |
+| SPARC | `ta 0x10` (`91 D0 20 10`) |
+
+### `libload_inject_dylib` — Remote dlopen
+
+Attaches via ptrace, hijacks thread registers to call `dlopen(path, RTLD_NOW)` in the target, catches the trap on return, restores registers. Resolves `dlopen` address by parsing `/proc/<pid>/maps` + libc symbol tables.
+
+### `libload_inject_spawn` — LD_PRELOAD
+
+Forks, sets the `LD_PRELOAD` environment variable to the `.so` path, then `execve`s the target. The dynamic linker loads the library before `main()`.
+
+**Limitations:** Does not work on statically-linked or setuid binaries.
+
+## Flat Binary Execution
+
+`libload_exec_bin` and `libload_run_bin` execute flat binary images produced by `lltool elf2bin`. These are static-pie ELF executables flattened to a contiguous image with BSS trimmed. The loader reads the preserved ELF header for entry point and program header info, computes total memsz from LOAD segments, maps RWX memory, copies the image, builds the initial stack with auxv, and jumps to the entry point.
+
+See [elf2bin.md](elf2bin.md) for format details and the C API.

@@ -27,6 +27,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <sys/auxv.h>
 #include <sys/mman.h>
 
 extern char **environ;
@@ -781,7 +782,17 @@ ll_jump_entry(struct ll_exec_info *info,
 
     uintptr_t *sp = (uintptr_t *)((uint8_t *)stack_base + stack_size);
 
-    int auxc = 6 * 2 + 2;
+    /* Place 16 random bytes at the top of the stack for AT_RANDOM.
+     * glibc uses these for stack canary / pointer guard init. */
+    sp -= 2; /* 16 bytes */
+    uintptr_t at_random_ptr = (uintptr_t)sp;
+    unsigned long host_random = getauxval(AT_RANDOM);
+    if (host_random)
+        memcpy((void *)sp, (void *)host_random, 16);
+    else
+        memset((void *)sp, 0x41, 16);
+
+    int auxc = 9 * 2 + 2;
     int total_slots = 1 + argc + 1 + envc + 1 + auxc;
     if (total_slots & 1)
         total_slots++;
@@ -805,6 +816,9 @@ ll_jump_entry(struct ll_exec_info *info,
     *p++ = AT_PHENT;  *p++ = info->phent;
     *p++ = AT_PHDR;   *p++ = info->phdr;
     *p++ = AT_PAGESZ; *p++ = (uintptr_t)getpagesize();
+    *p++ = AT_RANDOM; *p++ = at_random_ptr;
+    *p++ = AT_UID;    *p++ = (uintptr_t)getuid();
+    *p++ = AT_EUID;   *p++ = (uintptr_t)geteuid();
     *p++ = 0; *p++ = 0;
 
     ll_entry_trampoline((void *)sp, (void *)info->entry);
@@ -841,4 +855,104 @@ int libload_run(const unsigned char *buf, size_t len,
         return -1;
 
     ll_jump_entry(&info, argv, envp ? envp : environ);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Flat binary (elf2bin) execution                                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * bin_info trailer appended by elf2bin (--trailer).
+ * Sits at image + image_len - sizeof(struct bin_info).
+ */
+struct bin_info {
+#if __SIZEOF_POINTER__ == 8
+    int64_t start_function;
+    int64_t dynamic_linker_info;
+#else
+    int32_t start_function;
+    int32_t dynamic_linker_info;
+#endif
+    char    magic_number[4];
+} __attribute__((packed));
+
+#define BIN_MAGIC "\x7f" "BIN"
+
+static void __attribute__((noreturn))
+ll_exec_bin(char *image, size_t image_len)
+{
+    void (*e_entry)(long *, long *);
+    long stack[9] = {0};
+    long *dynv;
+
+    struct bin_info *image_info =
+        (struct bin_info *)(image + image_len - sizeof(*image_info));
+    e_entry = (void *)(image + image_info->start_function);
+
+    stack[0] = 1;
+    stack[1] = (intptr_t)"libc.so";
+    stack[2] = 0;
+    stack[3] = 0; /* empty envp */
+    stack[4] = AT_BASE; stack[5] = (intptr_t)image;
+    stack[6] = AT_NULL; stack[7] = 0;
+
+    dynv = (void *)(image + image_info->dynamic_linker_info);
+
+    e_entry(stack, dynv);
+    __builtin_unreachable();
+}
+
+pid_t libload_exec_bin(const unsigned char *buf, size_t len,
+                       char *const argv[], char *const envp[])
+{
+    (void)argv; (void)envp;
+
+    if (!buf || len < sizeof(struct bin_info))
+        return -1;
+
+    /* Verify trailer magic */
+    const struct bin_info *trl =
+        (const struct bin_info *)(buf + len - sizeof(struct bin_info));
+    if (memcmp(trl->magic_number, BIN_MAGIC, 4) != 0)
+        return -1;
+
+    pid_t pid = fork();
+    if (pid < 0)
+        return -1;
+
+    if (pid == 0) {
+        char *image = mmap(NULL, len,
+                           PROT_READ | PROT_WRITE | PROT_EXEC,
+                           MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+        if (image == MAP_FAILED)
+            _exit(127);
+        memcpy(image, buf, len);
+        LL_FLUSH_ICACHE(image, len);
+        ll_exec_bin(image, len);
+    }
+
+    return pid;
+}
+
+int libload_run_bin(const unsigned char *buf, size_t len,
+                    char *const argv[], char *const envp[])
+{
+    (void)argv; (void)envp;
+
+    if (!buf || len < sizeof(struct bin_info))
+        return -1;
+
+    const struct bin_info *trl =
+        (const struct bin_info *)(buf + len - sizeof(struct bin_info));
+    if (memcmp(trl->magic_number, BIN_MAGIC, 4) != 0)
+        return -1;
+
+    char *image = mmap(NULL, len,
+                       PROT_READ | PROT_WRITE | PROT_EXEC,
+                       MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (image == MAP_FAILED)
+        return -1;
+    memcpy(image, buf, len);
+    LL_FLUSH_ICACHE(image, len);
+    ll_exec_bin(image, len);
 }
